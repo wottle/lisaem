@@ -7058,6 +7058,15 @@ if (mouse_top_shows_menu_fullscreen)
         y -= oy;
         ;
       }
+      else if (lisa_ui_video_mode == vidmod_fill1024)
+      {
+        // Fill1024's displayed bitmap is 1024 wide (vs. the Lisa's native 720) - rescale the
+        // on-screen x coordinate back down to native Lisa coordinate space, the inverse of the
+        // 720->1024 box-filter resample RePaint_Fill1024 does when drawing.
+        x -= skin.screen_origin_x;
+        y -= skin.screen_origin_y;
+        x = x * 720 / 1024;
+      }
       else
       {
         x -= skin.screen_origin_x;
