@@ -1364,7 +1364,7 @@ t_ipc_table *cpu68k_makeipclist(uint32 pc)
     ipc = ipcs[instrs - 1 - 1]; // ipc--
     DEBUG_LOG(200, "ipc is now %p at pc %08lx max %06lx", ipc, (long)pc, (long)xpc);
 
-    if (iib->mnemonic == i_Bcc && ipc->src == xpc) // valgrind: ==24726== Conditional jump or move depends on uninitialised value(s)
+    if (0) // DISABLED: buggy speculative optimization, read ipcs[instrs+1] out of bounds (see valgrind comment below)
     {                                              // RA list->pc <- xpc
                                                    /* we have a 2-instruction block ending in a branch to start */
       ipc = ipcs[instrs - 1 + 1];                  // ipc++

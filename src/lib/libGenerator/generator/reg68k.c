@@ -3036,7 +3036,7 @@ void reg68k_internal_vector(int vno, uint32 oldpc, uint32 addr_error)
       ALERT_LOG(0, "Got back from fetchlong:%08lx", (long)x);
     }
 
-    if (x == 0xaf || x == oldpc)
+    if (x == 0xaf || (x == oldpc && (vno == V_BUSERR || vno == V_ADDRESS)))
     {
       loopy_vector--;
       abort_opcode = 0;
