@@ -6962,6 +6962,7 @@ void LisaWin::OnMouseMove(wxMouseEvent &event)
       on_startup_actions_done = 1;
     }
 
+#if !defined(__WXOSX__)
 if (mouse_top_shows_menu_fullscreen)
   {
     if (!FullScreenCheckMenuItem)
@@ -6990,6 +6991,7 @@ if (mouse_top_shows_menu_fullscreen)
       }
     }
   }
+#endif
     last_mouse_pos_x = pos.x;
     last_mouse_pos_y = pos.y; // not hidpi corrected - used for full screen menu pop-up
 
