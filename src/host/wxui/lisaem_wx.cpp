@@ -4356,6 +4356,16 @@ void LisaWin::OnChar(wxKeyEvent& event)
       my_lisaframe->OnFullScreen(foo);
       return;
     }
+    if (keycode == WXK_F12)
+    {
+      my_lisaframe->OnPOWERKEY(foo);
+      return;
+    }
+    if (keycode == (long)'P' && event.ControlDown() && event.AltDown())
+    {
+      my_lisaframe->OnPOWERKEY(foo);
+      return;
+    }
 #endif
 
     if (event.CmdDown())
@@ -9084,7 +9094,7 @@ LisaEmFrame::LisaEmFrame(const wxString& title)
     helpMenu->Append(ID_LISAFAQ, wxT("Lisa FAQ webpage"), wxT("https://lisafaq.sunder.net"));
     helpMenu->Append(ID_LISALIST2, wxT("LisaList2 Forum"), wxT("https://lisalist2.com"));
 
-    keyMenu->Append(ID_POWERKEY, wxT("Power Button"), wxT("Push the Power Button"));
+    keyMenu->Append(ID_POWERKEY, wxT("&Power Button\tF12"), wxT("Push the Power Button"));
     keyMenu->Append(ID_APPLEPOWERKEY, wxT("Apple+Power Button"), wxT("Push Apple + the Power Button"));
     keyMenu->AppendSeparator();
 
@@ -9166,7 +9176,7 @@ LisaEmFrame::LisaEmFrame(const wxString& title)
 
     menuBar->Append(fileMenu, wxT("File"));
     menuBar->Append(editMenu, wxT("Edit"));
-    menuBar->Append(keyMenu, wxT("Key"));
+    menuBar->Append(keyMenu, wxT("&Key"));
     menuBar->Append(DisplayMenu, wxT("Display"));
     menuBar->Append(throttleMenu, wxT("Throttle"));
     menuBar->Append(profileMenu, wxT("Parallel Port"));
