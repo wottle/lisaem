@@ -210,6 +210,7 @@ long emulation_time = 25;
 
 #include <LisaConfig.h>
 #include <LisaConfigFrame.h>
+#include <DialogLog.h>
 #include <LisaSkin.h>
 
 // sounds, images, etc.
@@ -1240,6 +1241,7 @@ void setup_hidpi(void)
 
 char *paste_to_keyboard = NULL;
 static int idx_paste_to_kb = 0;
+static int paste_from_keyboard_file = 0; // LISAEM_KEYBOARD_FILE: ^A + byte is a raw COPS code
 
 // ::TODO:: cleanup, remove
 // external interface to TerminalWx console - trampoline functions. Keypresses sent to console will mirror to my_lisawin
@@ -1903,6 +1905,290 @@ extern "C"  void dumpallscreenshot(void)
 
 #endif
 
+// LISAEM_SCREEN_DUMP=<file.png>: about once a second of host time, save the
+// Lisa's display (720x364, or 608x431 with the 3A ROM's XL screen; one bit
+// per pixel, read from video RAM) to that file, so a script can see the
+// screen without a window capture. The file
+// is written under a temporary name and renamed, so readers never see a
+// partial file.
+static void screen_dump_if_due(void)
+{
+    static int enabled = -1;
+    static char path[1024];
+    static wxLongLong last = 0;
+
+    if (enabled < 0)
+    {
+      const char *e = getenv("LISAEM_SCREEN_DUMP");
+      enabled = (e != NULL && *e != '\0');
+      if (enabled)
+        snprintf(path, sizeof(path), "%s", e);
+    }
+    if (!enabled || !lisaram)
+      return;
+
+    wxLongLong now = wxGetLocalTimeMillis();
+    if (now - last < 1000)
+      return;
+    last = now;
+
+    const int w = lisa_vid_size_x, h = lisa_vid_size_y, bytes_per_row = lisa_vid_size_xbytes;
+    wxImage image(w, h, false);
+    for (int y = 0; y < h; y++)
+      for (int x = 0; x < w; x++)
+      {
+        uint8 b = lisaram[videolatchaddress + y * bytes_per_row + (x >> 3)];
+        uint8 v = (b & (0x80 >> (x & 7))) ? 0 : 255;  // a set bit is black
+        image.SetRGB(x, y, v, v, v);
+      }
+
+    wxString tmp = wxString(path) + _T(".tmp");
+    if (image.SaveFile(tmp, wxBITMAP_TYPE_PNG))
+      wxRenameFile(tmp, wxString(path), true);
+}
+
+// LISAEM_RAM_DUMP=<file>: when <file>.req exists, save logical
+// $000000-$1FFFFF as seen through MMU context 1 to <file> and remove
+// <file>.req, so a script can read memory at a moment it chooses, or render
+// a frame buffer the Lisa does not display. Checked about once a second, and
+// only on request: a dump every second stalled the boot ROM's ProFile load.
+static void ram_dump_if_due(void)
+{
+    static wxLongLong last = 0;
+    const char *r = getenv("LISAEM_RAM_DUMP");
+    if (r == NULL || *r == '\0' || !lisaram)
+      return;
+
+    wxLongLong now = wxGetLocalTimeMillis();
+    if (now - last < 1000)
+      return;
+    last = now;
+
+    char req[1100], rtmp[1100];
+    snprintf(req, sizeof(req), "%s.req", r);
+    snprintf(rtmp, sizeof(rtmp), "%s.tmp", r);
+    if (access(req, F_OK) != 0)
+      return;
+    static uint8 buf[0x200000];
+    for (uint32 x = 0; x < 0x200000; x++)
+      buf[x] = lisaram[((mmu_all[1][(x >> 17) & 0x7f].sor << 9) + (x & 0x1ffff)) & 0x1fffff];
+    FILE *f = fopen(rtmp, "wb");
+    if (f)
+    {
+      fwrite(buf, 1, sizeof(buf), f);
+      fclose(f);
+      rename(rtmp, r);
+    }
+    unlink(req);
+    // and where the 68000 is, for a hang a memory image cannot show
+    extern uint32 reg68k_pc;
+    extern uint32 *reg68k_regs;
+    fprintf(stderr, "LISAEM_RAM_DUMP: PC %06lx", (long)(reg68k_pc & 0xffffff));
+    for (int i = 0; i < 16; i++)
+      fprintf(stderr, " %c%d %08lx", i < 8 ? 'D' : 'A', i & 7, (long)reg68k_regs[i]);
+    // and the VIAs' interrupt flags and enables, for an interrupt that
+    // will not clear
+    fprintf(stderr, " VIA1 IFR %02x IER %02x VIA2 IFR %02x IER %02x\n",
+            via[1].via[IFR], via[1].via[IER], via[2].via[IFR], via[2].via[IER]);
+}
+
+// LISAEM_KEYBOARD_FILE=<file>: about five times a second of host time, look
+// for bytes appended to that file since the last look and type them on the
+// Lisa keyboard, through the same path as Edit/Paste (one ASCII character
+// at a time, translated by keydecodetable). A script types by appending to
+// the file. Bytes that arrive while a paste is still going wait for it.
+// A ^A (0x01) byte followed by any byte B sends B to the COPS as a raw key
+// code (bit 7 set: key down, clear: key up), so a script can hold a key.
+static void keyboard_file_if_due(void)
+{
+    static int enabled = -1;
+    static char path[1024];
+    static long offset = 0;
+    static wxLongLong last = 0;
+
+    if (enabled < 0)
+    {
+      const char *e = getenv("LISAEM_KEYBOARD_FILE");
+      enabled = (e != NULL && *e != '\0');
+      if (enabled)
+        snprintf(path, sizeof(path), "%s", e);
+    }
+    if (!enabled || paste_to_keyboard)
+      return;
+
+    wxLongLong now = wxGetLocalTimeMillis();
+    if (now - last < 200)
+      return;
+    last = now;
+
+    FILE *f = fopen(path, "rb");
+    if (!f)
+      return;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    if (size < offset)       // file was truncated: start again from the top
+      offset = 0;
+    if (size > offset)
+    {
+      long n = size - offset;
+      char *buf = (char *)calloc(1, n + 1);
+      fseek(f, offset, SEEK_SET);
+      n = fread(buf, 1, n, f);
+      buf[n] = 0;
+      offset += n;
+      ALERT_LOG(0, "LISAEM_KEYBOARD_FILE: typing %ld bytes", n);
+      paste_to_keyboard = buf;
+      idx_paste_to_kb = 0;
+      paste_from_keyboard_file = 1;
+    }
+    fclose(f);
+}
+
+// LISAEM_MOUSE_MOVE_AT=<seconds>: once, that many seconds of host time
+// after the first check, do what moving the pointer to the middle of the
+// Lisa screen does (add_mouse_event, then seek_mouse_event), so a script
+// can test how a guest copes with mouse reports.
+static void mouse_move_if_due(void)
+{
+    static int enabled = -1;
+    static double seconds;
+    static wxLongLong start = 0;
+
+    if (enabled < 0)
+    {
+      const char *e = getenv("LISAEM_MOUSE_MOVE_AT");
+      enabled = (e != NULL && *e != '\0');
+      if (enabled)
+        seconds = atof(e);
+      start = wxGetLocalTimeMillis();
+    }
+    if (enabled != 1)
+      return;
+    if ((wxGetLocalTimeMillis() - start).ToDouble() < seconds * 1000.0)
+      return;
+    enabled = 2;
+    ALERT_LOG(0, "LISAEM_MOUSE_MOVE_AT: moving the mouse");
+    fprintf(stderr, "LISAEM_MOUSE_MOVE_AT: moving the mouse\n");
+    add_mouse_event(360, 182, 0);
+    seek_mouse_event();
+}
+
+// LISAEM_MOUSE_FILE=<file>: a script appends mouse commands to the file,
+// one per line: "move X Y", "click X Y", "dclick X Y", "down X Y", "up X Y"
+// (screen pixels, 720x364). Commands already in the file at start are
+// skipped, and one step runs every 100 ms. Moves and the button go through
+// add_mouse_event(), as for the host mouse, so a click happens where the
+// pointer arrives. While the file is in use, the host mouse over the window
+// is ignored.
+static int mouse_file_active(void)
+{
+    const char *e = getenv("LISAEM_MOUSE_FILE");
+    return e != NULL && *e != '\0';
+}
+
+static void mouse_file_if_due(void)
+{
+    static int enabled = -1;
+    static char path[1024];
+    static long offset = 0;
+    static wxLongLong last = 0;
+    static char steps[16];   // pending steps: 'm' move, 'd' down, 'u' up, 'h' hold
+    static int nsteps = 0, x = 0, y = 0;
+
+    if (enabled < 0)
+    {
+      enabled = mouse_file_active();
+      if (enabled)
+      {
+        snprintf(path, sizeof(path), "%s", getenv("LISAEM_MOUSE_FILE"));
+        FILE *f = fopen(path, "rb"); // commands already in the file are old: skip them
+        if (f)
+        {
+          fseek(f, 0, SEEK_END);
+          offset = ftell(f);
+          fclose(f);
+        }
+      }
+    }
+    if (!enabled)
+      return;
+
+    wxLongLong now = wxGetLocalTimeMillis();
+    if (now - last < 100)
+      return;
+    last = now;
+
+    if (nsteps == 0)
+    {
+      FILE *f = fopen(path, "rb");
+      if (!f)
+        return;
+      fseek(f, 0, SEEK_END);
+      long size = ftell(f);
+      if (size < offset)
+        offset = 0;
+      char line[128];
+      fseek(f, offset, SEEK_SET);
+      if (size > offset && fgets(line, sizeof(line), f) && strchr(line, '\n'))
+      {
+        offset += strlen(line);
+        char cmd[16];
+        if (sscanf(line, "%15s %d %d", cmd, &x, &y) == 3)
+        {
+          // 'h' holds for one step so the guest sees the button state
+          const char *seq = !strcmp(cmd, "click") ? "mdhu" : !strcmp(cmd, "dclick") ? "mdhudhu" :
+                            !strcmp(cmd, "down") ? "md" : !strcmp(cmd, "up") ? "mu" : "m";
+          // steps run from the end of the array
+          nsteps = strlen(seq);
+          for (int i = 0; i < nsteps; i++)
+            steps[nsteps - 1 - i] = seq[i];
+          fprintf(stderr, "LISAEM_MOUSE_FILE: %s %d %d\n", cmd, x, y);
+        }
+      }
+      fclose(f);
+      if (nsteps == 0)
+        return;
+    }
+
+    char step = steps[--nsteps];
+    if (step != 'h')
+    {
+      add_mouse_event(x, y, step == 'd' ? 1 : step == 'u' ? -1 : 0);
+      seek_mouse_event();
+    }
+}
+
+// LISAEM_FLOPPY_AT=<seconds>,<image>: once, that many seconds of host time
+// after start, insert the disk image into the floppy drive, as the menu's
+// insert command does, without restarting from it (unlike -f).
+static void floppy_insert_if_due(void)
+{
+    static int enabled = -1;
+    static double seconds;
+    static char path[1024];
+    static wxLongLong start = 0;
+
+    if (enabled < 0)
+    {
+      const char *e = getenv("LISAEM_FLOPPY_AT");
+      const char *comma = e ? strchr(e, ',') : NULL;
+      enabled = (comma != NULL && comma[1] != '\0');
+      if (enabled)
+      {
+        seconds = atof(e);
+        snprintf(path, sizeof(path), "%s", comma + 1);
+      }
+      start = wxGetLocalTimeMillis();
+    }
+    if (enabled != 1)
+      return;
+    if ((wxGetLocalTimeMillis() - start).ToDouble() < seconds * 1000.0)
+      return;
+    enabled = 2;
+    int r = floppy_insert(path, 0);
+    fprintf(stderr, "LISAEM_FLOPPY_AT: inserted %s, result %d\n", path, r);
+}
+
 void LisaEmFrame::Update_Status(long elapsed,long idleentry)
 {
     static int counter;
@@ -2009,7 +2295,13 @@ void LisaEmFrame::Update_Status(long elapsed,long idleentry)
       last_lisa_clock_secs = lisa_clock.secs_l;
     }
 #endif
-    
+    screen_dump_if_due();
+    ram_dump_if_due();
+    keyboard_file_if_due();
+    mouse_move_if_due();
+    mouse_file_if_due();
+    floppy_insert_if_due();
+
 }
 
 #if wxUSE_DRAG_AND_DROP
@@ -2253,13 +2545,21 @@ void LisaEmFrame::OnEmulationTimer(wxTimerEvent& event)
         if (paste_to_keyboard[idx_paste_to_kb])
         {
           ALERT_LOG(0, "Pasting to keyboard: %02x", paste_to_keyboard[idx_paste_to_kb]);
-          keystroke_cops(paste_to_keyboard[idx_paste_to_kb++]);
+          if (paste_from_keyboard_file && paste_to_keyboard[idx_paste_to_kb] == 0x01 &&
+              paste_to_keyboard[idx_paste_to_kb + 1])
+          {
+            send_cops_keycode((uint8)paste_to_keyboard[idx_paste_to_kb + 1]);
+            idx_paste_to_kb += 2;
+          }
+          else
+            keystroke_cops(paste_to_keyboard[idx_paste_to_kb++]);
         }
         else
         {
           idx_paste_to_kb = -1;
           free(paste_to_keyboard);
           paste_to_keyboard = NULL;
+          paste_from_keyboard_file = 0;
           ALERT_LOG(0, "//////// End of paste to keyboard ////////");
         }
       }
@@ -7718,12 +8018,13 @@ void LisaWin::OnMouseMove(wxMouseEvent &event)
           b = -1;
         if (event.LeftDown())
           b = 1;
-        add_mouse_event(x, y, b);
+        if (!mouse_file_active())
+          add_mouse_event(x, y, b);
       }
       seek_mouse_event();
 
       // double click hack  - fixme BUG BUG BUG - fixme - well timing bug, will not be fixed if 32Mhz is allowed
-      if (lu)
+      if (lu && !mouse_file_active())
       {
         if (now - lastup < 1500)
         {
@@ -8317,6 +8618,12 @@ extern "C" int yesnomessagebox(char *s, char *t)  // messagebox string of text, 
     text << s;
     wxString title = "";
     title << t;
+    if (LisaEmNoDialogs())
+    {
+        LisaEmLogDialog(title, text, false);
+        return (LisaEmDialogDefault(wxYES_NO | wxNO_DEFAULT) == wxID_YES);
+    }
+    LisaEmLogDialog(title, text, true);
     wxMessageDialog w(my_lisawin, text, title, wxICON_QUESTION | wxYES_NO | wxNO_DEFAULT, wxDefaultPosition);
     return (w.ShowModal() == wxID_YES);
 }
@@ -8352,7 +8659,9 @@ void update_menu_checkmarks(void)
 
       DisplayMenu->Check(ID_VID_SKINS, !!skins_on);
       DisplayMenu->Check(ID_VID_SKINLESSCENTER, !!skinless_center);
+#ifndef __WXOSX__
       DisplayMenu->Check(ID_VID_MOUSETOPMENU, !!mouse_top_shows_menu_fullscreen);
+#endif
 
       if (!!my_lisaframe)
       {
@@ -9365,7 +9674,9 @@ LisaEmFrame::LisaEmFrame(const wxString& title)
     DisplayMenu->AppendSeparator();
     DisplayMenu->AppendCheckItem(ID_VID_SKINS, wxT("Skin"), wxT("Turn skins on/off"));
     DisplayMenu->AppendCheckItem(ID_VID_SKINLESSCENTER, wxT("Center when skinless"), wxT("Center the display when skins are turned off"));
+#ifndef __WXOSX__
     DisplayMenu->AppendCheckItem(ID_VID_MOUSETOPMENU, wxT("Mouse-to-top reveals menu in fullscreen"), wxT("Moving the mouse to the top edge exits fullscreen to show the menu bar; uncheck if this is triggered unintentionally on a small display"));
+#endif
     DisplayMenu->Append(ID_VID_SKINSELECT, wxT("Change Skin"), wxT("Skin Select"));
     DisplayMenu->AppendSeparator();
 
@@ -10086,7 +10397,6 @@ extern "C" void connect_device_to_serial(int port, FILE **scc_port_F, uint8 *ser
       return;
     }
 
-#ifndef __MSVCRT__
     if (setting->IsSameAs(_T("TelnetD"), false))
     {
       unsigned long x;
@@ -10102,6 +10412,7 @@ extern "C" void connect_device_to_serial(int port, FILE **scc_port_F, uint8 *ser
       return;
     }
 
+#ifndef __MSVCRT__
     if (setting->IsSameAs(_T("PseudoTTY"), false))
     {
       unsigned long x;
@@ -10137,23 +10448,6 @@ extern "C" void connect_device_to_serial(int port, FILE **scc_port_F, uint8 *ser
       return;
     }
 
-    if (setting->IsSameAs(_T("Terminal"), false))
-    {
-      unsigned long x;
-      *scc_port_F = NULL;
-      *serial = SCC_TERMINAL;
-
-      ALERT_LOG(0, "-----------------------------------------\n\n");
-      ALERT_LOG(0, "Attaching new terminal to serial port %d", port);
-
-      init_terminal_serial_port(port);
-
-      ALERT_LOG(0, "return from init_terminal_serial_port %d", port);
-      ALERT_LOG(0, "-----------------------------------------\n\n");
-
-      return;
-    }
-
     if (setting->IsSameAs(_T("Serial"), false))
     {
       unsigned long x;
@@ -10172,6 +10466,23 @@ extern "C" void connect_device_to_serial(int port, FILE **scc_port_F, uint8 *ser
     }
 
 #endif
+
+    if (setting->IsSameAs(_T("Terminal"), false))
+    {
+      unsigned long x;
+      *scc_port_F = NULL;
+      *serial = SCC_TERMINAL;
+
+      ALERT_LOG(0, "-----------------------------------------\n\n");
+      ALERT_LOG(0, "Attaching new terminal to serial port %d", port);
+
+      init_terminal_serial_port(port);
+
+      ALERT_LOG(0, "return from init_terminal_serial_port %d", port);
+      ALERT_LOG(0, "-----------------------------------------\n\n");
+
+      return;
+    }
 
     if (setting->IsSameAs(_T("ImageWriter"), false))
     {
@@ -10735,7 +11046,9 @@ extern "C" void rename_rompath(char *rompath)
     if (!my_lisaconfig)
       return;
 
-    my_lisaconfig->rompath = wxString(rompath, wxConvLocal, 2048); // wxSTRING_MAXLEN);
+    // no length: with one, wxString converts that many bytes, past the end of the
+    // name, and the conversion fails on what follows, leaving the path empty.
+    my_lisaconfig->rompath = wxString(rompath, wxConvLocal);
     my_lisaconfig->Save(pConfig, floppy_ram);
 
     if (my_LisaConfigFrame)

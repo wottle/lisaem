@@ -231,8 +231,10 @@ void dump_cops(FILE *buglog) { my_dump_cops(buglog); }
     set_kb_data_ready();                                                           \
     DEBUG_LOG(0, "COPS queue len: %d adding 0x%02x", copsqueuelen, (unsigned)(x)); \
     if (copsqueuelen >= 0 && (copsqueuelen + 1 < MAXCOPSQUEUE))                    \
+    {                                                                              \
       copsqueue[copsqueuelen] = (x);                                               \
-    copsqueuelen++;                                                                \
+      copsqueuelen++;                                                              \
+    }                                                                              \
   }
 
 #define cops_reset_status(x)                                              \
@@ -240,8 +242,10 @@ void dump_cops(FILE *buglog) { my_dump_cops(buglog); }
     set_kb_data_ready();                                                  \
     DEBUG_LOG(0, "COPS queue len: %d adding reset (0x80)", copsqueuelen); \
     if (copsqueuelen >= 0 && (copsqueuelen + 1 < MAXCOPSQUEUE))           \
+    {                                                                     \
       copsqueue[copsqueuelen] = 0x80;                                     \
-    copsqueuelen++;                                                       \
+      copsqueuelen++;                                                     \
+    }                                                                     \
   }
 #define SEND_RESETCOPS_AND_CODE(x)                                                           \
   {                                                                                          \
@@ -840,7 +844,7 @@ void init_clock(void)
   clktime = time(&clktime);
   timev = (struct tm *)localtime(&clktime);
 
-  yday = timev->tm_yday;
+  yday = timev->tm_yday + 1; // COPS counts days of the year from 1, tm_yday from 0
   dd_hun = (uint8)(yday / 100);
   dd_ten = (uint8)((yday / 10) % 10);
   dd_one = (uint8)(yday % 10);
@@ -1357,7 +1361,7 @@ void add_mouse_event(int16 x, int16 y, int8 button)
     mousequeuelen = 0;
   } // we overflowed, just dump the old ones 20060609 17:15
 
-  if (!cops_mouse || contrast == 0xff)
+  if (!cops_mouse || (contrast == 0xff && getenv("LISAEM_CONTRAST_OLD"))) // the Lisa's mouse works at $FF
     return;
 
   if (x < 0 || x > lisa_vid_size_x || y < 0 || y > lisa_vid_size_y)
@@ -1405,7 +1409,7 @@ void seek_mouse_event(void)
 
   mouse_pending = 0;
 
-  if (!cops_mouse || contrast == 0xff || !mousequeuelen)
+  if (!cops_mouse || (contrast == 0xff && getenv("LISAEM_CONTRAST_OLD")) || !mousequeuelen)
   {
     DEBUG_LOG(0, "skipping seek_mouse_event because:%d,%d,%d\n", cops_mouse, contrast, mousequeuelen);
     return;
@@ -1449,6 +1453,36 @@ void seek_mouse_event(void)
   {
     dx = 0;
     dy = 0;
+  }
+
+  // Nor keep moving a pointer that does not move. Code that reads the COPS
+  // itself, rather than through the vectors the position is read from here,
+  // leaves that position as it was: the motion would go on for ever, and
+  // a loop waiting for the COPS to go quiet with it. Half a second of
+  // emulated time without the position changing, and the target counts as
+  // reached. The count starts again when the host pointer moves to a new
+  // target: otherwise one stall (e.g. a target past the edge the OS clamps
+  // the pointer to) gave up on every later target too, and the pointer
+  // never moved again.
+  {
+    static uint16 stall_x = 0xffff, stall_y = 0xffff;
+    static int16 stall_tx = -1, stall_ty = -1;
+    static XTIMER stall_since = 0;
+    if (!(dx | dy) || ratx != stall_x || raty != stall_y ||
+        mousequeue[1].x != stall_tx || mousequeue[1].y != stall_ty)
+    {
+      stall_x = ratx;
+      stall_y = raty;
+      stall_tx = mousequeue[1].x;
+      stall_ty = mousequeue[1].y;
+      stall_since = cpu68k_clocks;
+    }
+    else if (cpu68k_clocks - stall_since > 2500000)
+    {
+      DEBUG_LOG(0, "mouse stalled at %d,%d: giving up on %d,%d", ratx, raty, mousequeue[1].x, mousequeue[1].y);
+      dx = 0;
+      dy = 0;
+    }
   }
 
   // do we need to move some more?  If so move, otherwise see if there has been a click, and send that.

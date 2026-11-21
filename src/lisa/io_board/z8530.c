@@ -257,12 +257,14 @@ void write_serial_port_imagewriter(unsigned int port, char data);
 uint32 get_baud_rate(unsigned int port);
 void set_baud_rate(int port, uint32 baud);
 
-//::TODO:: find a way to implement a windows version of telnetd and pty/tty
-#ifndef __MSVCRT__
-
+// TelnetD works on every platform (Winsock on Windows).
 extern char read_serial_port_telnetd(unsigned int port);
 extern void write_serial_port_telnetd(unsigned int port, char c);
 extern int poll_telnet_serial_read(int portnum);
+extern void check_telnet_connection(int portnum);
+
+//::TODO:: find a way to implement a windows version of pty/tty
+#ifndef __MSVCRT__
 
 extern char read_serial_port_shell(unsigned int port);
 extern void write_serial_port_shell(unsigned int port, char c);
@@ -281,7 +283,6 @@ extern void set_port_baud_tty(int port, uint32 baud);
 char read_serial_port_shell(unsigned int port) { return 0; }
 char read_serial_port_pty(unsigned int port) { return 0; }
 extern char read_serial_port_tty(unsigned int port);
-int poll_telnet_serial_read(int portnum) { return 0; }
 #endif
 
 // void write_serial_port_terminal(int port, uint8 data); //(jamesdenton) type mismatch between uint8 and char; need to address this
@@ -558,14 +559,17 @@ void read_port_if_ready_tty(unsigned int port)
 
 void read_port_if_ready_telnetd(unsigned int port)
 {
-  if (fliflo_buff_is_full(&SCC_READ[port]))
+  if (fliflo_buff_is_full(&SCC_READ[port]) || (port == 0 && waiting_for_lisa_to_read_port_b))
+  {
+    check_telnet_connection(port); // no room for data, but a client may have come or gone
     return;
-  if (port == 0 && waiting_for_lisa_to_read_port_b)
-    return;
+  }
   if (port == 0 && (cpu68k_clocks - port_b_last_lisa_read_clock_timestamp < SCC_MIN_CYCLES_BETWEEN_READS))
     return;
-  char data = poll_telnet_serial_read(port);
-  if (data != -1)
+  // int, not char: a 0xff data byte read into a char equals -1 ("no data")
+  // and was dropped.  Anything below 0 (-1 no data, -2 break) is not data.
+  int data = poll_telnet_serial_read(port);
+  if (data >= 0)
   {
     if (port == 0)
     {
@@ -707,13 +711,13 @@ void initialize_scc(int actual)
       scc_fn[port].set_dtr = set_dtr_loopbackplug;
       scc_fn[port].set_rts = set_rts_loopbackplug;
       break;
-#ifndef __MSVCRT__
     case SCC_TELNETD:
       scc_fn[port].read_serial_port = read_serial_port_telnetd;
       scc_fn[port].write_serial_port = write_serial_port_telnetd;
       scc_fn[port].read_port_if_ready = read_port_if_ready_telnetd;
       break;
 
+#ifndef __MSVCRT__
     case SCC_SHELL:
       scc_fn[port].read_serial_port = read_serial_port_shell;
       scc_fn[port].write_serial_port = write_serial_port_shell;
@@ -735,15 +739,15 @@ void initialize_scc(int actual)
       scc_fn[port].set_baud_rate = set_port_baud_tty;
 
       break;
+#else
+    // fallthrough to default for unsupported on windows
+#endif
     case SCC_TERMINAL:
       scc_fn[port].read_serial_port = read_serial_port_terminal;
       scc_fn[port].write_serial_port = write_serial_port_terminal;
       scc_fn[port].read_port_if_ready = read_port_if_ready_terminal;
       break;
 
-#else
-    // fallthrough to default for unsupported on windows
-#endif
     default: // fallthrough, includes SCC_NOTHING.
       // ALERT_LOG(0,"Not sure what to connect to this port");
       scc_fn[port].read_serial_port = read_serial_port_nothing;
@@ -1046,6 +1050,23 @@ static inline void avoid_rom_scc_tests(void)
 }
 
 // want to set scc_r[port].s.rr0.r.rx_char_available=HAS_DATA, scc_r[port].s.rr0.r.tx_buffer_empty=1, scc_r[port].s.rr0.r.dcd=1, scc_r[port].s.rr0.r.cts=1
+
+// The transmit delay (z8530_event, set when a byte is sent) has run out:
+// the transmit buffer is empty, which interrupts only a channel whose
+// transmit interrupts are on (WR1), with the master enable (WR9) set, as
+// TX_BUFF_EMPTY does when a byte is written. It used to flag channel B's
+// transmit interrupt (128) whatever the enables: a guest that sends with
+// transmit interrupts off never cleared it, and the CPU went round the
+// guest's SCC interrupt handler for good.
+void z8530_tx_done(void)
+{
+  if (!scc_w[0].s.wr9.r.MIE)
+    return;
+  if (scc_w[0].s.wr1.r.txintenable)
+    TX_BUFF_EMPTY(0)
+  else if (scc_w[1].s.wr1.r.txintenable)
+    TX_BUFF_EMPTY(1)
+}
 
 int get_scc_pending_irq(void)
 {
@@ -1757,11 +1778,11 @@ uint8 lisa_rb_Oxd200_sccz8530(uint32 address)
 
     // need to insert other pollers here for polled I/O
     // poll_telnet_serial_read(port);
-#ifndef __MSVCRT__
       if (serial_b == SCC_TELNETD)
         read_port_if_ready_telnetd(0);
       if (serial_a == SCC_TELNETD)
         read_port_if_ready_telnetd(1);
+#ifndef __MSVCRT__
       if (serial_b == SCC_SHELL)
         read_port_if_ready_shell(0);
       if (serial_a == SCC_SHELL)
@@ -1786,7 +1807,12 @@ uint8 lisa_rb_Oxd200_sccz8530(uint32 address)
       scc_r[port].s.rr0.r.cts = get_cts(port);
       scc_r[port].s.rr0.r.break_abort = get_break(port);
       scc_r[port].s.rr0.r.sync_hunt = 0;
-      scc_r[port].s.rr0.r.tx_underrun_eom = (!scc_w[port].s.wr5.r.txenable);
+      // Tx Underrun/EOM is a latch: "Reset Tx Underrun/EOM" (WR0 $C0) clears it
+      // and the chip sets it when the transmitter runs out of data. Bytes here
+      // leave at once, so an empty buffer is an underrun. MacWorks Plus II's
+      // LocalTalk send resets it after a frame and spins at IPL 6 until it sets.
+      if (!scc_w[port].s.wr5.r.txenable || fliflo_buff_is_empty(&SCC_WRITE[port]))
+        scc_r[port].s.rr0.r.tx_underrun_eom = 1;
       scc_r[port].s.rr0.r.zero_count = 0;
       
       // sync hunt fakeout

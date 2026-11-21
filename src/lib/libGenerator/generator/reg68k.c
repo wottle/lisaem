@@ -816,6 +816,404 @@ void dumpallmmu(void)
 
 #endif
 
+/* LISAEM_CPU_TRACE=<file>: log instructions whose PC is in
+ * LISAEM_CPU_TRACE_RANGE (hex "lo-hi", default 0-ffffff), at most
+ * LISAEM_CPU_TRACE_MAX lines (default 2000000). Each line has the PC, the
+ * cached opcode and operands of the pre-decoded instruction (IPC), the
+ * words in memory at the PC, SR and registers. Before logging, the
+ * instruction is decoded again from memory; if the cached operands differ
+ * the line is marked STALE (the IPC cache only checks the opcode word).
+ * With LISAEM_CPU_TRACE_MODE=stale only STALE lines are written.
+ */
+static int cpu_trace_state = -1;
+static FILE *cpu_trace_file = NULL;
+static uint32 cpu_trace_lo = 0, cpu_trace_hi = 0xffffff;
+static long cpu_trace_left = 2000000;
+static int cpu_trace_stale_only = 0;
+
+static void cpu_trace_init(void)
+{
+  const char *e = getenv("LISAEM_CPU_TRACE");
+  cpu_trace_state = 0;
+  if (e == NULL || *e == '\0')
+    return;
+  cpu_trace_file = fopen(e, "w");
+  if (!cpu_trace_file)
+    return;
+  const char *r = getenv("LISAEM_CPU_TRACE_RANGE");
+  if (r)
+  {
+    unsigned long lo, hi;
+    if (sscanf(r, "%lx-%lx", &lo, &hi) == 2)
+    {
+      cpu_trace_lo = (uint32)lo;
+      cpu_trace_hi = (uint32)hi;
+    }
+  }
+  const char *m = getenv("LISAEM_CPU_TRACE_MAX");
+  if (m)
+    cpu_trace_left = atol(m);
+  const char *md = getenv("LISAEM_CPU_TRACE_MODE");
+  cpu_trace_stale_only = (md != NULL && strcmp(md, "stale") == 0);
+  fprintf(cpu_trace_file, "# LisaEm CPU trace, PC range %06x-%06x\n", cpu_trace_lo, cpu_trace_hi);
+  fflush(cpu_trace_file);
+  cpu_trace_state = 1;
+}
+
+/* Log the MMU state whenever it changes, and flag inconsistencies: the
+ * register table (mmu) or page table (mmu_trans) not being the one for
+ * the current context, or context not matching start/segment1/segment2.
+ */
+static void cpu_trace_mmu_state(uint32 pc)
+{
+  static int last_start = -1, last_context = -1, last_s1 = -1, last_s2 = -1;
+  static void *last_mmu = NULL, *last_trans = NULL;
+  int bad = (mmu != mmu_all[context]) || (mmu_trans != mmu_trans_all[context]) ||
+            (context != CXSASEL);
+
+  if (start != last_start || context != last_context || segment1 != last_s1 || segment2 != last_s2 ||
+      (void *)mmu != last_mmu || (void *)mmu_trans != last_trans || bad)
+  {
+    fprintf(cpu_trace_file, "%06x MMU start=%d context=%d s1=%d s2=%d cxsasel=%d mmu=cx%d trans=cx%d%s\n",
+            pc & 0xffffff, start, context, segment1, segment2, (int)CXSASEL,
+            (int)(((uint8 *)mmu - (uint8 *)mmu_all[0]) / (long)((uint8 *)mmu_all[1] - (uint8 *)mmu_all[0])),
+            (int)(((uint8 *)mmu_trans - (uint8 *)mmu_trans_all[0]) / (long)((uint8 *)mmu_trans_all[1] - (uint8 *)mmu_trans_all[0])),
+            bad ? " INCONSISTENT" : "");
+    fflush(cpu_trace_file);
+    last_start = start;
+    last_context = context;
+    last_s1 = segment1;
+    last_s2 = segment2;
+    last_mmu = (void *)mmu;
+    last_trans = (void *)mmu_trans;
+  }
+}
+
+/* LISAEM_CPU_TRACE_WATCH=<logical address, hex>: after every instruction,
+ * compare the byte in physical RAM for that address in context 1 with the
+ * byte read through the current page translation, and log any change of
+ * either, and of the page's translation entry.
+ */
+static long cpu_trace_watch = -1;
+
+static void cpu_trace_watch_check(uint32 pc)
+{
+  static int last_phys = -1, last_read = -1;
+  static int32 last_address = 0x7fffffff;
+  static int last_rfn = -1;
+  uint32 a = (uint32)cpu_trace_watch;
+  uint32 phys = ((mmu_all[1][(a >> 17) & 0x7f].sor << 9) + (a & 0x1ffff)) & 0x1fffff;
+  int pv = lisaram[phys];
+  mmu_trans_t *mt = &mmu_trans_all[1][(a & 0xfffe00) >> 9];
+  int rv = -1;
+  if (mt->readfn == ram)
+    rv = lisaram[((uint32)((int32)a + mt->address)) & 0x1fffff];
+
+  if (pv != last_phys || rv != last_read || mt->address != last_address || (int)mt->readfn != last_rfn)
+  {
+    fprintf(cpu_trace_file, "%06x WATCH %06x phys=%06x byte=%02x read=%02x trans.address=%08x readfn=%d\n",
+            pc & 0xffffff, a, phys, pv, rv & 0xff, mt->address, (int)mt->readfn);
+    fflush(cpu_trace_file);
+    last_phys = pv;
+    last_read = rv;
+    last_address = mt->address;
+    last_rfn = (int)mt->readfn;
+  }
+}
+
+/* LISAEM_CPU_CHECK=<lo>-<hi>[,<seconds>] (hex PCs): run every instruction whose PC
+ * is in that range on Musashi as well (src/lib/musashi/cpucheck.c), after the
+ * given seconds of host time, and log where the two cores disagree: registers,
+ * PC, SR (condition codes only where Generator computed them: it skips flags
+ * that nothing reads) and memory writes. Instructions that touch anything but
+ * RAM are skipped, as are F-line traps (LisaEm's HLE), STOP and RESET. The log
+ * goes to LISAEM_CPU_CHECK_LOG, else stderr: the first 60 disagreements, and a
+ * count every 10 s.
+ */
+#include "../../musashi/cpucheck.h"
+
+static int cc_enabled = -1, cc_active = 0;
+static uint32 cc_lo, cc_hi;
+static time_t cc_after_at, cc_stat_at;
+static FILE *cc_log;
+static cc_regs cc_in, cc_mus;
+static t_ipc *cc_ipc;
+static unsigned long cc_checked, cc_skipped, cc_bad;
+
+int cc_mem_read(unsigned addr, unsigned *val)
+{
+  mmu_trans_t *t = &mmu_trans[(addr & MMUEPAGEFL) >> 9];
+  int32 p;
+  if (t->readfn != ram && t->readfn != vidram)
+    return -1;
+  p = (int32)(addr & ADDRESSFILT) + t->address;
+  if (p < (int32)minlisaram || p >= (int32)maxlisaram)
+    return -1;
+  *val = lisaram[p];
+  return 0;
+}
+
+int cc_writable(unsigned addr, int size)
+{
+  for (int k = 0; k < size; k++)
+  {
+    mmu_trans_t *t = &mmu_trans[((addr + k) & MMUEPAGEFL) >> 9];
+    if (t->writefn != ram && t->writefn != vidram)
+      return -1;
+  }
+  return 0;
+}
+
+static void cc_get(cc_regs *r, uint32 pc)
+{
+  for (int i = 0; i < 8; i++)
+  {
+    r->d[i] = reg68k_regs[i];
+    r->a[i] = reg68k_regs[8 + i];
+  }
+  r->sr = reg68k_sr.sr_int;
+  r->pc = pc;                        /* all 32 bits: a 68000 stacks the whole PC */
+  r->osp = regs.sp;
+}
+
+static void cpucheck_pre(t_ipc *ipc, uint32 pc)
+{
+  cc_active = 0;
+  if (cc_enabled < 0)
+  {
+    const char *e = getenv("LISAEM_CPU_CHECK"), *l = getenv("LISAEM_CPU_CHECK_LOG");
+    unsigned long lo, hi;
+    int secs = 0;
+    cc_enabled = (e != NULL && sscanf(e, "%lx-%lx,%d", &lo, &hi, &secs) >= 2);
+    if (!cc_enabled)
+      return;
+    cc_lo = lo;
+    cc_hi = hi;
+    cc_after_at = secs > 0 ? time(NULL) + secs : 0;
+    cc_log = (l && *l) ? fopen(l, "w") : NULL;
+    if (!cc_log)
+      cc_log = stderr;
+    fprintf(cc_log, "LISAEM_CPU_CHECK %06lx-%06lx after %d s\n", lo, hi, secs);
+    fflush(cc_log);
+    cc_init();
+  }
+  if (!cc_enabled)
+    return;
+  pc &= 0xffffff;
+  if (pc < cc_lo || pc > cc_hi)
+    return;
+  if (cc_after_at && time(NULL) < cc_after_at)
+    return;
+  if ((ipc->opcode & 0xf000) == 0xf000 || ipc->opcode == 0x4e72 || ipc->opcode == 0x4e70)
+    return;
+  cc_get(&cc_in, reg68k_pc);
+  if (cc_step(&cc_in, &cc_mus))
+  {
+    cc_skipped++;
+    return;
+  }
+  cc_ipc = ipc;
+  cc_active = 1;
+}
+
+static void cc_dump(const char *tag, const cc_regs *r)
+{
+  fprintf(cc_log, "  %-8s pc=%06x sr=%04x osp=%08x\n           d=", tag, r->pc & 0xffffff, r->sr, r->osp);
+  for (int i = 0; i < 8; i++)
+    fprintf(cc_log, "%08x%c", r->d[i], i < 7 ? ',' : '\n');
+  fprintf(cc_log, "           a=");
+  for (int i = 0; i < 8; i++)
+    fprintf(cc_log, "%08x%c", r->a[i], i < 7 ? ',' : '\n');
+}
+
+static void cpucheck_post(void)
+{
+  cc_regs gen;
+  char why[256] = "";
+  int n = 0;
+
+  if (!cc_active)
+    return;
+  cc_active = 0;
+  if (abort_opcode)                  /* Generator took a bus/address error mid-instruction */
+  {
+    cc_skipped++;
+    return;
+  }
+  cc_get(&gen, reg68k_pc);
+  cc_checked++;
+
+  /* condition codes: those the instruction does not touch must agree; those it
+     sets only if Generator kept them (ipc->set != 0 selects the flag-computing
+     version of the instruction) */
+  t_iib *iib = cpu68k_iibtable[cc_ipc->opcode];
+  unsigned fs = iib ? iib->flags.set : 0, ccrset = 0;
+  if (fs & IIB_FLAG_X) ccrset |= 0x10;
+  if (fs & IIB_FLAG_N) ccrset |= 0x08;
+  if (fs & IIB_FLAG_Z) ccrset |= 0x04;
+  if (fs & IIB_FLAG_V) ccrset |= 0x02;
+  if (fs & IIB_FLAG_C) ccrset |= 0x01;
+  unsigned srmask = 0xa71f;           /* the SR bits a 68000 has (T, S, I2-I0, XNZVC) */
+  if (!cc_ipc->set)
+    srmask &= ~ccrset;
+
+  for (int i = 0; i < 8; i++)
+  {
+    if (gen.d[i] != cc_mus.d[i])
+      n += snprintf(why + n, sizeof(why) - n, " D%d", i);
+    if (gen.a[i] != cc_mus.a[i])
+      n += snprintf(why + n, sizeof(why) - n, " A%d", i);
+  }
+  if (gen.pc != cc_mus.pc)
+    n += snprintf(why + n, sizeof(why) - n, " PC");
+  if ((gen.sr & srmask) != (cc_mus.sr & srmask))
+    n += snprintf(why + n, sizeof(why) - n, " SR(mask %04x)", srmask);
+  if (gen.osp != cc_mus.osp)
+    n += snprintf(why + n, sizeof(why) - n, " otherSP");
+  for (int i = 0; i < cc_nwrites; i++)
+  {
+    uint32 v = 0, a = cc_writes[i].addr;
+    for (int k = 0; k < cc_writes[i].size; k++)
+    {
+      unsigned b;
+      if (cc_mem_read(a + k, &b) != 0)
+        b = 0;
+      v = (v << 8) | b;
+    }
+    if (v != cc_writes[i].val && n < (int)sizeof(why) - 40)
+      n += snprintf(why + n, sizeof(why) - n, " mem[%06x].%d=%x(musashi %x)", a, cc_writes[i].size, v, cc_writes[i].val);
+  }
+
+  if (n)
+  {
+    cc_bad++;
+    if (cc_bad <= 60)
+    {
+      char dis[128];
+      cc_disasm(cc_in.pc, dis);
+      fprintf(cc_log, "MISMATCH #%lu at %06x %04x  %s:%s  (ipc set %x)\n", cc_bad, cc_in.pc, cc_ipc->opcode, dis, why, cc_ipc->set);
+      cc_dump("before", &cc_in);
+      cc_dump("lisaem", &gen);
+      cc_dump("musashi", &cc_mus);
+      fflush(cc_log);
+    }
+  }
+  if (time(NULL) - cc_stat_at >= 10)
+  {
+    cc_stat_at = time(NULL);
+    fprintf(cc_log, "LISAEM_CPU_CHECK: %lu checked, %lu skipped, %lu mismatches\n", cc_checked, cc_skipped, cc_bad);
+    fflush(cc_log);
+  }
+}
+
+static void cpu_trace(t_ipc *ipc, uint32 pc)
+{
+  if (cpu_trace_state < 0)
+  {
+    cpu_trace_init();
+    const char *w = getenv("LISAEM_CPU_TRACE_WATCH");
+    if (w)
+      cpu_trace_watch = strtol(w, NULL, 16);
+  }
+  if (cpu_trace_state != 1)
+    return;
+  cpu_trace_mmu_state(pc);
+  if (cpu_trace_watch >= 0)
+    cpu_trace_watch_check(pc);
+
+  /* LISAEM_CPU_TRACE_DUMP="<pc>,<lo>-<hi>" (hex): the first time the PC
+   * reaches <pc>, write logical <lo>-<hi> as seen through context 1 to
+   * <trace file>.ram.
+   */
+  {
+    static int dump_state = -1;
+    static unsigned long dpc, dlo, dhi;
+    if (dump_state < 0)
+    {
+      const char *d = getenv("LISAEM_CPU_TRACE_DUMP");
+      dump_state = (d && sscanf(d, "%lx,%lx-%lx", &dpc, &dlo, &dhi) == 3) ? 1 : 0;
+    }
+    if (dump_state == 1 && (pc & 0xffffff) == dpc)
+    {
+      char name[1100];
+      snprintf(name, sizeof(name), "%s.ram", getenv("LISAEM_CPU_TRACE"));
+      FILE *f = fopen(name, "wb");
+      for (unsigned long x = dlo; f && x < dhi; x++)
+      {
+        uint32 phys = ((mmu_all[1][(x >> 17) & 0x7f].sor << 9) + (x & 0x1ffff)) & 0x1fffff;
+        fputc(lisaram[phys], f);
+      }
+      if (f)
+        fclose(f);
+      fprintf(cpu_trace_file, "%06x DUMP %06lx-%06lx to %s\n", pc & 0xffffff, dlo, dhi, name);
+      dump_state = 2;
+    }
+  }
+  pc &= 0xffffff;
+
+  /* LISAEM_CPU_TRACE_START=<pc> (hex): log nothing until the PC first
+   * reaches <pc>.
+   */
+  {
+    static int start_state = -1;
+    static unsigned long spc;
+    if (start_state < 0)
+    {
+      const char *st = getenv("LISAEM_CPU_TRACE_START");
+      start_state = (st && sscanf(st, "%lx", &spc) == 1) ? 1 : 0;
+    }
+    if (start_state == 1)
+    {
+      if (pc != spc)
+        return;
+      fprintf(cpu_trace_file, "%06x START\n", pc);
+      start_state = 2;
+    }
+  }
+
+  if (pc < cpu_trace_lo || pc > cpu_trace_hi)
+    return;
+  if (cpu_trace_left <= 0)
+  {
+    if (cpu_trace_left == 0)
+      fprintf(cpu_trace_file, "# trace line limit reached\n");
+    cpu_trace_left = -1;
+    fflush(cpu_trace_file);
+    return;
+  }
+
+  int stale = 0;
+  uint16 op = fetchword(pc);
+  t_iib *iib = cpu68k_iibtable[op];
+  t_ipc fresh;
+  if (iib)
+  {
+    int saved_abort = abort_opcode;
+    memset(&fresh, 0, sizeof(fresh));
+    cpu68k_ipc(pc, iib, &fresh);
+    abort_opcode = saved_abort;
+    stale = (fresh.opcode != ipc->opcode || fresh.src != ipc->src || fresh.dst != ipc->dst ||
+             fresh.sreg != ipc->sreg || fresh.dreg != ipc->dreg || fresh.wordlen != ipc->wordlen);
+  }
+  if (cpu_trace_stale_only && !stale)
+    return;
+  cpu_trace_left--;
+
+  fprintf(cpu_trace_file, "%06x %04x src=%08x dst=%08x len=%d mem=", pc, ipc->opcode, ipc->src, ipc->dst, ipc->wordlen);
+  for (int i = 0; i < 5; i++)
+    fprintf(cpu_trace_file, "%04x", fetchword(pc + 2 * i));
+  fprintf(cpu_trace_file, " sr=%04x d=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x a=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+          reg68k_sr.sr_int, reg68k_regs[0], reg68k_regs[1], reg68k_regs[2], reg68k_regs[3], reg68k_regs[4], reg68k_regs[5],
+          reg68k_regs[6], reg68k_regs[7], reg68k_regs[8], reg68k_regs[9], reg68k_regs[10], reg68k_regs[11], reg68k_regs[12],
+          reg68k_regs[13], reg68k_regs[14], reg68k_regs[15]);
+  if (stale)
+    fprintf(cpu_trace_file, " STALE fresh: src=%08x dst=%08x sreg=%04x dreg=%04x len=%d cached sreg=%04x dreg=%04x",
+            fresh.src, fresh.dst, fresh.sreg, fresh.dreg, fresh.wordlen, ipc->sreg, ipc->dreg);
+  fputc('\n', cpu_trace_file);
+  if (stale || (cpu_trace_left & 0x3ff) == 0)
+    fflush(cpu_trace_file);
+}
+
 unsigned int reg68k_external_step(void)
 {
   static t_ipc ipc;
@@ -2381,7 +2779,11 @@ int32 reg68k_external_execute(int32 clocks)
           static int tested;
           uint32 opc = pc24;
 #endif
+          if (cpu_trace_state != 0)
+            cpu_trace(ipc, pc24);
+          cpucheck_pre(ipc, pc24);
           ipc->function(ipc);
+          cpucheck_post();
 #ifdef CHECK_HIGH_BYTE_PRESERVE
           if ((opc & 0xff000000) != 0 && (reg68k_pc & 0xff000000) == 0)
           {
@@ -2934,6 +3336,36 @@ void reg68k_internal_vector(int vno, uint32 oldpc, uint32 addr_error)
     if (line15_hle_intercept())
       return;
   }
+  if (vno == V_LINE10)
+  {
+    /* LISAEM_TRAPLOG=lo-hi (hex A-line trap words): each trap in that range
+       and the place it was called from, once each, as for a program calling
+       a trap the system has not got */
+    static int tl = -1, tn = 0;
+    static unsigned lo, hi;
+    static uint32 tseen[512];
+    if (tl < 0)
+    {
+      const char *e = getenv("LISAEM_TRAPLOG");
+      tl = e && sscanf(e, "%x-%x", &lo, &hi) == 2;
+    }
+    if (tl)
+    {
+      unsigned w = lisa_ram_safe_getword(context, oldpc);
+      if (w >= lo && w <= hi)
+      {
+        uint32 key = (w << 16) ^ (oldpc & 0xffffff);
+        int i;
+        for (i = 0; i < tn && tseen[i] != key; i++)
+          ;
+        if (i == tn && tn < 512)
+        {
+          tseen[tn++] = key;
+          fprintf(stderr, "TRAPLOG: %04x from %06lx\n", w, (long)(oldpc & 0xffffff));
+        }
+      }
+    }
+  }
   if (vno == 2 && reg68k_pc == 0x0002001c && addr_error == 0x00400000 && macworks4mb)
   {
     enable_4MB_macworks();
@@ -3302,6 +3734,30 @@ void lisa_addrerror(uint32 addr_error)
 #ifndef CPU_CORE_TESTER
   ALERT_LOG(0, "Odd Address Exception @%08lx PC=%08lx clk:%016llx ", (long)addr_error, (long)reg68k_pc, (long long)cpu68k_clocks);
   DEBUG_LOG(0, "ADDRESS EXCEPTION @%08lx PC=%08lx", (long)addr_error, (long)reg68k_pc);
+  {
+    /* LISAEM_ADDRERR_DUMP=<file>: at the first address error, logical
+       $000000-$1FFFFF in MMU context 1 (as LISAEM_RAM_DUMP writes it) and
+       the registers, so the stack is seen before the error handling writes
+       over it */
+    static int dumped = 0;
+    const char *f = getenv("LISAEM_ADDRERR_DUMP");
+    if (f && !dumped)
+    {
+      FILE *o = fopen(f, "wb");
+      dumped = 1;
+      if (o)
+      {
+        for (uint32 x = 0; x < 2 * 1024 * 1024; x++)
+          fputc(lisaram[((mmu_all[1][(x >> 17) & 0x7f].sor << 9) + (x & 0x1ffff)) & 0x1fffff], o);
+        fclose(o);
+      }
+      fprintf(stderr, "LISAEM_ADDRERR_DUMP: %s; access %08lx PC %08lx context %d D0-D7", f,
+              (long)addr_error, (long)reg68k_pc, (int)context);
+      for (int i = 0; i < 16; i++)
+        fprintf(stderr, "%s %08lx", i == 8 ? " A0-A7" : "", (long)reg68k_regs[i]);
+      fprintf(stderr, " SR %04x\n", reg68k_sr.sr_int);
+    }
+  }
   if (reg68k_pc == lastaddrpc)
     return;
   reg68k_internal_vector(3, reg68k_pc, addr_error);
