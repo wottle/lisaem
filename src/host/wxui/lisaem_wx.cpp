@@ -7378,7 +7378,8 @@ void LisaWin::OnMouseMove(wxMouseEvent &event)
     if (y < 0)
     {
       y = 0;
-      mouse_in_crt = 0;
+      if (lisa_ui_video_mode != vidmod_fill1024) // LISAEM-PATCH: Fill mode clamps instead of releasing the pointer
+        mouse_in_crt = 0;
     }
 
     if (!skins_on && lisa_ui_video_mode == vidmod_hq35x)
@@ -7392,10 +7393,17 @@ void LisaWin::OnMouseMove(wxMouseEvent &event)
     }
     else
     {
-      if (y > o_effective_lisa_vid_size_y)
+      if (y > o_effective_lisa_vid_size_y || (lisa_ui_video_mode == vidmod_fill1024 && y >= o_effective_lisa_vid_size_y))
       {
-        y = o_effective_lisa_vid_size_y;
-        mouse_in_crt = 0;
+        // LISAEM-PATCH: in Fill mode clamp to the last valid row (screen_to_mouse[] is only filled up to size-1;
+        // index == size reads a zero and sent the Lisa cursor to the top) instead of releasing the pointer.
+        if (lisa_ui_video_mode == vidmod_fill1024)
+          y = o_effective_lisa_vid_size_y - 1;
+        else
+        {
+          y = o_effective_lisa_vid_size_y;
+          mouse_in_crt = 0;
+        }
       }
       if (lisa_ui_video_mode == vidmod_fitwindow && fitwindow_screen_to_mouse && y < fitwindow_screen_to_mouse_cap)
         y = fitwindow_screen_to_mouse[y];
@@ -7405,7 +7413,10 @@ void LisaWin::OnMouseMove(wxMouseEvent &event)
 
     if (x < 0 || x > lisa_vid_size_x)
     {
-      mouse_in_crt = 0;
+      if (lisa_ui_video_mode == vidmod_fill1024) // LISAEM-PATCH
+        x = (x < 0) ? 0 : (lisa_vid_size_x - 1);
+      else
+        mouse_in_crt = 0;
     }
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
