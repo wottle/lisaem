@@ -6271,6 +6271,15 @@ int LisaWin::OnPaint_skinless(wxRect &rect, DCTYPE &dc)
     wxRect r = my_lisaframe->GetRect(); // these are outside the viewport, and the true size of the window, unscaled - want this one!
     w_width = r.GetWidth();
     w_height = r.GetHeight();
+    // LISAEM-PATCH: in Fill 1024x768 the frame rectangle is sometimes taller than the screen (intermittent),
+    // which pushed the picture down and clipped its bottom. Centre using the window's own client area instead.
+    int patch_cw = 0, patch_ch = 0;
+    GetClientSize(&patch_cw, &patch_ch);
+    if (lisa_ui_video_mode == vidmod_fill1024 && patch_cw > 0 && patch_ch > 0)
+    {
+      w_width = patch_cw;
+      w_height = patch_ch;
+    }
     ww_width = w_width / hidpi_scale;
     ww_height = w_height / hidpi_scale;
 
@@ -7092,7 +7101,8 @@ if (mouse_top_shows_menu_fullscreen)
     if (y < 0)
     {
       y = 0;
-      mouse_in_crt = 0;
+      if (lisa_ui_video_mode != vidmod_fill1024) // LISAEM-PATCH: Fill mode clamps instead of releasing the pointer
+        mouse_in_crt = 0;
     }
 
     if (!skins_on && lisa_ui_video_mode == vidmod_hq35x)
@@ -7106,17 +7116,27 @@ if (mouse_top_shows_menu_fullscreen)
     }
     else
     {
-      if (y > o_effective_lisa_vid_size_y)
+      if (y > o_effective_lisa_vid_size_y || (lisa_ui_video_mode == vidmod_fill1024 && y >= o_effective_lisa_vid_size_y))
       {
-        y = o_effective_lisa_vid_size_y;
-        mouse_in_crt = 0;
+        // LISAEM-PATCH: in Fill mode clamp to the last valid row (screen_to_mouse[] is only filled up to size-1;
+        // index == size reads a zero and sent the Lisa cursor to the top) instead of releasing the pointer.
+        if (lisa_ui_video_mode == vidmod_fill1024)
+          y = o_effective_lisa_vid_size_y - 1;
+        else
+        {
+          y = o_effective_lisa_vid_size_y;
+          mouse_in_crt = 0;
+        }
       }
       y = screen_to_mouse[y];
     }
 
     if (x < 0 || x > lisa_vid_size_x)
     {
-      mouse_in_crt = 0;
+      if (lisa_ui_video_mode == vidmod_fill1024) // LISAEM-PATCH
+        x = (x < 0) ? 0 : (lisa_vid_size_x - 1);
+      else
+        mouse_in_crt = 0;
     }
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
