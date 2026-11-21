@@ -4523,6 +4523,20 @@ void LisaWin::OnChar(wxKeyEvent& event)
       my_lisaframe->OnFullScreen(foo);
       return;
     }
+
+    // The Power Button menu item's "Ctrl-Alt-P" label never had a working
+    // accelerator, on any platform - menu accelerators are dispatched from
+    // OnKeyDown/wx's own key-event chain, which this class's OnKeyDown
+    // never Skip()s for non-arrow-key/non-asciikeyboard-mode keys, so the
+    // frame-level accelerator table never sees the keystroke. F12 is
+    // wired here the same hardcoded way F11 already is above, matching
+    // the fix applied on the lisa-fixes-1024x768 branch - this is what
+    // the GPIO power-button watcher actually presses.
+    if (keycode == WXK_F12)
+    {
+      my_lisaframe->OnPOWERKEY(foo);
+      return;
+    }
 #endif
 
     // Zoom/Pause/floppy-insert used to be hijacked here by hand because their
